@@ -4,8 +4,6 @@ This repository contains a small loss-scoring experiment for comparing OpenAI `o
 
 The main script computes answer-only loss on saved `o1` responses using a Hugging Face causal language model.
 
-## Repository contents
-
 ```text
 R1testUnicode/
 ├── O1_UnicodeandASCII/

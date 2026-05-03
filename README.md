@@ -1,16 +1,9 @@
 # R1testUnicode
 
-This repository contains a small loss-scoring experiment for comparing OpenAI `o1` response files under different JSON/text serialization formats, including default ASCII-escaped JSON and Unicode-preserving JSON.
-
-The main script computes answer-only loss on saved `o1` responses using a Hugging Face causal language model.
-
-```text
-R1testUnicode/
-├── O1_UnicodeandASCII/
-│   ├── o1__responses_default.jsonl
-│   └── o1_openmath__responses_unicode.jsonl
-├── run_o1_loss_r1.py
-└── requirements.txt
+This repo contains:
+- `run_o1_loss_r1.py` — computes answer-only loss for DeepSeek-R1 on saved OpenAI `o1` responses
+- `O1_UnicodeandASCII/` — JSONL response files comparing Unicode-preserving vs ASCII/default serialization
+- `requirements.txt`
 
 ## Setup
 
@@ -25,6 +18,23 @@ Run:
 ~~~bash
 python run_o1_loss_r1.py
 ~~~
+
+By default, the script scores up to 200 examples from each file and writes results to:
+
+~~~text
+outputs_r1/DeepSeek-R1__o1_losses.json
+~~~
+
+## Notes
+
+- Uses `deepseek-ai/DeepSeek-R1` as the scoring model.
+- Computes answer-only average negative log-likelihood.
+- Compares:
+  - `o1_openmath__responses_unicode.jsonl` — Unicode-preserving responses
+  - `o1__responses_default.jsonl` — default/ASCII-style responses
+- `LOAD_IN_8BIT = False` by default. Keep this setting unless 8-bit loading works in your environment.
+- Uses `bfloat16` by default through `DTYPE = "bfloat16"`.
+- The script is hard-coded: edit the settings at the top of `run_o1_loss_r1.py` if you want to change model, dataset directory, output directory, limit, dtype, or max length.
 
 ## Hugging Face Cache
 
@@ -50,6 +60,10 @@ Main dependencies:
 - sentencepiece
 - safetensors
 - huggingface-hub
+- tokenizers
+- protobuf
+- einops
+- hf-xet
 
 Install all via:
 

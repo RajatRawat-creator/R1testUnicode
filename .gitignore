@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+.DS_Store
+logs/
+*.out
+*.err
+*.log
+*.pt
+*.pth
+*.safetensors
+*.bin
+.cache/

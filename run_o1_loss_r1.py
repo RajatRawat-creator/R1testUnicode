@@ -12,6 +12,18 @@ import os
 import re
 from pathlib import Path
 
+# ============================================================
+# Disable Transformers' hub-kernel mapping BEFORE importing
+# transformers. The kernels-community/deep-gemm prebuilt wheel
+# can throw `deep_gemm::DGException` at runtime on GPU/CUDA
+# combos it wasn't tuned for; the built-in Triton/PyTorch FP8
+# fallback is more portable.
+# ============================================================
+os.environ.setdefault("DISABLE_KERNEL_MAPPING", "1")
+os.environ.setdefault("HF_HUB_DISABLE_KERNELS", "1")
+# Uncomment to localize any future CUDA assert to the real op:
+# os.environ.setdefault("CUDA_LAUNCH_BLOCKING", "1")
+
 import numpy as np
 import torch
 from transformers import (
@@ -34,6 +46,339 @@ if not hasattr(_tf_import_utils, "is_torch_fx_available"):
     _tf_import_utils.is_torch_fx_available = _is_torch_fx_available
 
 
+# ============================================================
+# Compatibility patch for transformers v5 FineGrainedFP8 +
+# DeepseekV3Config. The library's _first_attr() helper only
+# probes ("num_local_experts", "num_experts") but DeepSeek-V3
+# stores the count as `n_routed_experts`, and the new dataclass
+# config doesn't go through PretrainedConfig.__getattribute__'s
+# attribute_map remap, so hasattr() returns False and load fails.
+# ============================================================
+try:
+    import transformers.integrations.finegrained_fp8 as _tf_fp8
+
+    _orig_first_attr = _tf_fp8._first_attr
+
+    def _patched_first_attr(obj, *names):
+        extra = ("n_routed_experts",)
+        for name in (*names, *extra):
+            if hasattr(obj, name):
+                return getattr(obj, name)
+        raise AttributeError(
+            f"{type(obj).__name__} has none of: {(*names, *extra)}"
+        )
+
+    _tf_fp8._first_attr = _patched_first_attr
+except Exception as _e:  # pragma: no cover
+    print(f"[WARN] could not patch finegrained_fp8._first_attr: {_e}", flush=True)
+
+
+# ============================================================
+# Compatibility patch for transformers v5 FineGrainedFP8:
+# replace_with_fp8_linear() mutates the module tree while
+# iterating model.named_modules(). After replacing `...experts`
+# (a ModuleList) with a flat FP8Experts, the generator keeps
+# walking the OLD ModuleList's children (experts.0.gate_proj,
+# ...) and then calls set_submodule("...experts.0.gate_proj",
+# FP8Linear), which fails with:
+#   AttributeError: FP8Experts has no attribute `0`
+# We monkey-patch to (1) snapshot the module list first and
+# (2) skip any name that lives under an already-replaced prefix.
+# ============================================================
+try:
+    import torch.nn as _nn
+    import transformers.integrations.finegrained_fp8 as _tf_fp8m
+
+    _orig_replace_with_fp8_linear = _tf_fp8m.replace_with_fp8_linear
+
+    def _patched_replace_with_fp8_linear(
+        model,
+        modules_to_not_convert=None,
+        quantization_config=None,
+        pre_quantized=False,
+    ):
+        if quantization_config is None or getattr(
+            quantization_config, "dequantize", False
+        ):
+            import inspect as _inspect
+
+            _orig_params = _inspect.signature(
+                _orig_replace_with_fp8_linear
+            ).parameters
+            _kwargs = {
+                "modules_to_not_convert": modules_to_not_convert,
+                "quantization_config": quantization_config,
+            }
+            if "pre_quantized" in _orig_params:
+                _kwargs["pre_quantized"] = pre_quantized
+            return _orig_replace_with_fp8_linear(model, **_kwargs)
+
+        # Older transformers (<5) don't expose FP8Experts /
+        # use_experts_implementation; the experts-vs-ModuleList
+        # bug only exists in v5, so just defer to the original.
+        if not all(
+            hasattr(_tf_fp8m, _n)
+            for _n in (
+                "FP8Experts",
+                "ALL_FP8_EXPERTS_FUNCTIONS",
+                "use_experts_implementation",
+                "should_convert_module",
+            )
+        ):
+            import inspect as _inspect
+
+            _orig_params = _inspect.signature(
+                _orig_replace_with_fp8_linear
+            ).parameters
+            _kwargs = {
+                "modules_to_not_convert": modules_to_not_convert,
+                "quantization_config": quantization_config,
+            }
+            if "pre_quantized" in _orig_params:
+                _kwargs["pre_quantized"] = pre_quantized
+            return _orig_replace_with_fp8_linear(model, **_kwargs)
+
+        FP8Linear = _tf_fp8m.FP8Linear
+        FP8Experts = _tf_fp8m.FP8Experts
+        ALL_FP8_EXPERTS_FUNCTIONS = _tf_fp8m.ALL_FP8_EXPERTS_FUNCTIONS
+        use_experts_implementation = _tf_fp8m.use_experts_implementation
+        should_convert_module = _tf_fp8m.should_convert_module
+
+        # Snapshot the tree first.
+        snapshot = list(model.named_modules())
+        pending = []
+        replaced_prefixes = []
+
+        for module_name, module in snapshot:
+            if not should_convert_module(module_name, modules_to_not_convert):
+                continue
+            # Skip anything inside an already-scheduled replacement.
+            if any(
+                module_name == p or module_name.startswith(p + ".")
+                for p in replaced_prefixes
+            ):
+                continue
+
+            module_kwargs = {} if pre_quantized else {"dtype": None}
+            new_module = None
+            with torch.device("meta"):
+                if module_name.endswith(".experts"):
+                    has_gate = getattr(module, "has_gate", True)
+                    has_bias = getattr(module, "has_bias", False)
+                    config = getattr(
+                        module, "config", model.config.get_text_config()
+                    )
+                    new_class = use_experts_implementation(
+                        experts_class=FP8Experts,
+                        experts_interface=ALL_FP8_EXPERTS_FUNCTIONS,
+                        has_bias=has_bias,
+                        has_gate=has_gate,
+                    )
+                    new_module = new_class(
+                        config=config,
+                        block_size=quantization_config.weight_block_size,
+                        activation_scheme=quantization_config.activation_scheme,
+                        has_bias=has_bias,
+                        has_gate=has_gate,
+                        **module_kwargs,
+                    )
+                    replaced_prefixes.append(module_name)
+                elif isinstance(module, _nn.Linear):
+                    new_module = FP8Linear(
+                        in_features=module.in_features,
+                        out_features=module.out_features,
+                        block_size=quantization_config.weight_block_size,
+                        activation_scheme=quantization_config.activation_scheme,
+                        has_bias=module.bias is not None,
+                        **module_kwargs,
+                    )
+            if new_module is not None:
+                pending.append((module_name, new_module))
+
+        for name, new_module in pending:
+            model.set_submodule(name, new_module)
+
+        if not pending:
+            import logging
+
+            logging.getLogger(__name__).warning(
+                "fp8 patch: no linear/experts modules were replaced."
+            )
+        return model
+
+    _tf_fp8m.replace_with_fp8_linear = _patched_replace_with_fp8_linear
+    # The quantizer imported the symbol at module load time, repoint it too.
+    try:
+        import transformers.quantizers.quantizer_finegrained_fp8 as _tf_q_fp8
+
+        _tf_q_fp8.replace_with_fp8_linear = _patched_replace_with_fp8_linear
+    except Exception:
+        pass
+except Exception as _e:  # pragma: no cover
+    print(
+        f"[WARN] could not patch finegrained_fp8.replace_with_fp8_linear: {_e}",
+        flush=True,
+    )
+
+
+# ============================================================
+# Compatibility patch for FP8 weight initialization.
+#
+# DeepSeek-R1's checkpoint stores Linear weights as
+# torch.float8_e4m3fn. After loading, transformers v5 calls
+# _initialize_missing_keys -> initialize_weights -> smart_apply,
+# which invokes the remote modeling_deepseek.py's _init_weights:
+#
+#     module.weight.data.normal_(mean=0.0, std=std)
+#
+# This crashes with:
+#     RuntimeError: "normal_kernel_cuda" not implemented for 'Float8_e4m3fn'
+#
+# The FP8 weights were already loaded from the checkpoint and
+# must NOT be reinitialized anyway. Make Tensor.normal_ a no-op
+# for FP8 dtypes so the unconditional re-init silently skips them.
+# ============================================================
+try:
+    _FP8_DTYPES = tuple(
+        dt for dt in (
+            getattr(torch, "float8_e4m3fn", None),
+            getattr(torch, "float8_e5m2", None),
+            getattr(torch, "float8_e4m3fnuz", None),
+            getattr(torch, "float8_e5m2fnuz", None),
+        )
+        if dt is not None
+    )
+
+    _orig_tensor_normal_ = torch.Tensor.normal_
+
+    def _safe_tensor_normal_(self, *args, **kwargs):
+        if self.dtype in _FP8_DTYPES:
+            # Loaded FP8 weights; do not touch.
+            return self
+        return _orig_tensor_normal_(self, *args, **kwargs)
+
+    torch.Tensor.normal_ = _safe_tensor_normal_
+except Exception as _e:  # pragma: no cover
+    print(f"[WARN] could not patch torch.Tensor.normal_ for FP8: {_e}", flush=True)
+
+
+# ============================================================
+# Compatibility patch for transformers v5 finegrained-fp8
+# Triton kernel loader.
+#
+# transformers calls
+#     hub_kernels.lazy_load_kernel("finegrained-fp8")
+# which under the hood does
+#     get_kernel("kernels-community/finegrained-fp8", version=1)
+# That call can silently fall back to None (FileNotFoundError /
+# AssertionError swallowed in lazy_load_kernel) when the pinned
+# hub version doesn't have a wheel matching the local torch+cuda
+# variant. The downstream _load_triton_kernel then sees all four
+# expected attributes as None and raises:
+#     ImportError: finegrained-fp8 kernel is missing required
+#     functions: w8a8_fp8_matmul, fp8_act_quant,
+#     w8a8_fp8_matmul_batched, w8a8_fp8_matmul_grouped.
+#
+# We replace _load_triton_kernel with a version that fetches the
+# kernel via the unpinned `get_kernel` path (which we verified
+# does expose all four functions for the current torch build).
+# ============================================================
+try:
+    import transformers.integrations.finegrained_fp8 as _tf_fp8k
+    from transformers.integrations.hub_kernels import get_kernel as _tf_get_kernel
+
+    def _patched_load_triton_kernel():
+        if _tf_fp8k._triton_available is True:
+            return
+        if _tf_fp8k._triton_available is False:
+            # Re-attempt anyway: previous failure was due to the
+            # version-pinned lazy loader, not a real load failure.
+            _tf_fp8k._triton_available = None
+
+        _tf_fp8k._triton_available = False  # mark attempted
+
+        kernel = _tf_get_kernel("kernels-community/finegrained-fp8")
+
+        _tf_fp8k.triton_fp8_matmul = getattr(kernel, "w8a8_fp8_matmul", None)
+        _tf_fp8k.triton_fp8_act_quant = getattr(kernel, "fp8_act_quant", None)
+        _tf_fp8k.triton_batched_fp8_matmul = getattr(
+            kernel, "w8a8_fp8_matmul_batched", None
+        )
+        _tf_fp8k.triton_grouped_fp8_matmul = getattr(
+            kernel, "w8a8_fp8_matmul_grouped", None
+        )
+
+        missing = [
+            n for n, a in [
+                ("w8a8_fp8_matmul", _tf_fp8k.triton_fp8_matmul),
+                ("fp8_act_quant", _tf_fp8k.triton_fp8_act_quant),
+                ("w8a8_fp8_matmul_batched", _tf_fp8k.triton_batched_fp8_matmul),
+                ("w8a8_fp8_matmul_grouped", _tf_fp8k.triton_grouped_fp8_matmul),
+            ] if a is None
+        ]
+        if missing:
+            raise ImportError(
+                "finegrained-fp8 kernel (patched loader) is still missing: "
+                + ", ".join(missing)
+            )
+
+        _tf_fp8k._triton_available = True
+
+    _tf_fp8k._load_triton_kernel = _patched_load_triton_kernel
+except Exception as _e:  # pragma: no cover
+    print(
+        f"[WARN] could not patch finegrained_fp8._load_triton_kernel: {_e}",
+        flush=True,
+    )
+
+
+# ============================================================
+# Compatibility patch for torch 2.6 + finegrained-fp8 kernel.
+#
+# The hub kernel uses PEP 585 generic annotations like
+#     block_size: list[int]
+# inside @triton_op. torch 2.6's torch._library.infer_schema only
+# whitelists `typing.List[int]`, so it raises:
+#     ValueError: infer_schema(func): Parameter block_size has
+#         unsupported type list[int].
+#
+# We extend SUPPORTED_PARAM_TYPES with the lowercase generic
+# variants (list[T], tuple[T, ...]) mapped to the same schema
+# strings as their typing.* counterparts.
+# ============================================================
+try:
+    import typing as _typing
+    import torch._library.infer_schema as _torch_infer_schema
+
+    _SPT = _torch_infer_schema.SUPPORTED_PARAM_TYPES
+    _new_entries = {}
+    for _typ, _schema in list(_SPT.items()):
+        # Translate typing.List[T] / typing.Sequence[T] -> list[T]
+        _origin = getattr(_typ, "__origin__", None)
+        _args = getattr(_typ, "__args__", None)
+        if _origin in (list, _typing.List) and _args:
+            _lower = list[_args[0]]  # e.g. list[int]
+            if _lower not in _SPT:
+                _new_entries[_lower] = _schema
+        # Optional[list/Sequence[T]]
+        if _origin is _typing.Union and _args:
+            _non_none = [a for a in _args if a is not type(None)]
+            if len(_non_none) == 1:
+                _inner = _non_none[0]
+                _inner_origin = getattr(_inner, "__origin__", None)
+                _inner_args = getattr(_inner, "__args__", None)
+                if _inner_origin in (list, _typing.List) and _inner_args:
+                    _lower = _typing.Optional[list[_inner_args[0]]]
+                    if _lower not in _SPT:
+                        _new_entries[_lower] = _schema
+    _SPT.update(_new_entries)
+except Exception as _e:  # pragma: no cover
+    print(
+        f"[WARN] could not patch torch infer_schema for PEP 585 generics: {_e}",
+        flush=True,
+    )
+
+
 # =========================
 # HARD-CODED SETTINGS
 # =========================
@@ -54,7 +399,11 @@ DTYPE = "bfloat16"
 # Usually keep as "auto"
 DEVICE_MAP = "auto"
 
-TRUST_REMOTE_CODE = True
+TRUST_REMOTE_CODE = True            # tokenizer may still need remote code
+TRUST_REMOTE_CODE_MODEL = False     # native DeepseekV3ForCausalLM is FP8-aware;
+                                    # remote modeling_deepseek.py's moe_infer
+                                    # does len(self.experts)/self.experts[i],
+                                    # which breaks against fused FP8Experts.
 LOCAL_FILES_ONLY = False
 DEBUG = False
 
@@ -454,7 +803,7 @@ def main():
                 device_map=DEVICE_MAP,
                 quantization_config=quant_config,
                 dtype=torch_dtype,
-                trust_remote_code=TRUST_REMOTE_CODE,
+                trust_remote_code=TRUST_REMOTE_CODE_MODEL,
                 local_files_only=LOCAL_FILES_ONLY,
                 low_cpu_mem_usage=True,
                 max_memory=max_memory,
@@ -464,7 +813,7 @@ def main():
                 MODEL_NAME,
                 device_map=DEVICE_MAP,
                 dtype=torch_dtype,
-                trust_remote_code=TRUST_REMOTE_CODE,
+                trust_remote_code=TRUST_REMOTE_CODE_MODEL,
                 local_files_only=LOCAL_FILES_ONLY,
                 low_cpu_mem_usage=True,
                 max_memory=max_memory,

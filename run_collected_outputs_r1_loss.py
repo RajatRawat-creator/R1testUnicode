@@ -448,6 +448,10 @@ FILES_MAP = {
 
     "QwQ-32B Preview (OMI, Trace + Response)": "QwQ-32B-Preview-omi(200).jsonl",
     "QwQ-32B Preview (s1, Trace + Response)": "QwQ-32B-Preview-s1(200).jsonl",
+
+    
+    "GPT-OSS-120B (OMI, Response)": "gpt-oss-120b_omi(200).jsonl",
+    "GPT-OSS-120B (s1, Response)": "gpt-oss-120b_s1(200).jsonl",
 }
 
 

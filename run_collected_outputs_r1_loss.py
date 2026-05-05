@@ -426,16 +426,7 @@ FILES_MAP = {
     "Gemma-3-27B-it (s1, Response Only)": "gemma-3-27b-it__s1k__chat__vllm.jsonl",
 
     "Claude-3.5-Sonnet (OMI, Response Only)": "Claude-Sonnet-3.5_omi(200).jsonl",
-    "Claude-3.5-Sonnet (s1, Response Only)": "Claude-Sonnet-3.5_s1(200).jsonl",
-
-    "DeepSeek R1 (OMI, Trace + Response)": "R1_omi(200)_reasoningonly.jsonl",
-    "DeepSeek R1 (s1, Trace + Response)": "R1_s1(200)_reasoningonly.jsonl",
-
-    "DeepSeek R1 (OMI, Response Only)": "R1_omi(200)_responseonly.jsonl",
-    "DeepSeek R1 (s1, Response Only)": "R1_s1(200)_responseonly.jsonl",
-
-    "Qwen-3-235B-A22B-Thinking-2507 (OMI, Trace + Response)": "Qwen-3-235B_omi(200)_reasoningonly.jsonl",
-    "Qwen-3-235B-A22B-Thinking-2507 (s1, Trace + Response)": "Qwen-3-235B_s1(200)_reasoningonly.jsonl",
+    "Claude-3.5-Sonnet (s1, Response Only)": "Claude-Sonnet-3.5_s1(200).jsonl", 
 
     "Claude Opus 4.5 (OMI, Trace + Response)": "claude-opus-4-5-20251101__openmath_jsonl__chat__claude_reasoning_only__REPAIRED.jsonl",
     "Claude Opus 4.5 (s1, Trace + Response)": "claude-opus-4-5-20251101__s1k__chat__claude_reasoning_only__REPAIRED.jsonl",

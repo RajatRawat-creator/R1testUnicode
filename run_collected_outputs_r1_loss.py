@@ -390,6 +390,10 @@ LIMIT_PER_DATASET = 200
 
 MAX_LENGTH = 32768
 
+# Cap on answer tokens (post-tokenize, pre max_length trim).
+# Set to None to disable. Keeps the head of the answer.
+MAX_ANSWER_TOKENS = 2048
+
 # Choose one of: "float16", "bfloat16", "float32"
 DTYPE = "bfloat16"
 
@@ -603,11 +607,12 @@ class ModelWrapper:
     - if answer alone too long, keep answer tail
     - mask prompt tokens with -100
     """
-    def __init__(self, model, tokenizer, max_length: int, debug: bool = False, debug_max_print: int = 20):
+    def __init__(self, model, tokenizer, max_length: int, max_answer_tokens=None, debug: bool = False, debug_max_print: int = 20):
         self.model = model
         self.tokenizer = tokenizer
         self.device = get_input_device(model)
         self.max_length = max_length
+        self.max_answer_tokens = max_answer_tokens
         self.debug = debug
         self.debug_max_print = debug_max_print
         self._dbg_prints = 0
@@ -642,7 +647,13 @@ class ModelWrapper:
         orig_answer_len = len(answer_ids)
         orig_total = orig_prompt_len + orig_answer_len
 
-        if orig_total > self.max_length:
+        # Cap answer to max_answer_tokens (keep head).
+        if self.max_answer_tokens is not None and len(answer_ids) > self.max_answer_tokens:
+            answer_ids = answer_ids[:self.max_answer_tokens]
+
+        eff_total = len(prompt_ids) + len(answer_ids)
+
+        if eff_total > self.max_length:
             if len(answer_ids) >= self.max_length:
                 # Keep the tail of the answer, retain one prompt token.
                 answer_ids = answer_ids[-(self.max_length - 1):]
@@ -658,8 +669,8 @@ class ModelWrapper:
         if self.debug and self._dbg_prints < self.debug_max_print:
             print(
                 f"[DBG] prompt={len(prompt_ids)} answer={len(answer_ids)} total={len(input_ids_list)} "
-                f"(orig_prompt={orig_prompt_len} orig_answer={orig_answer_len} orig_total={orig_total}) "
-                f"trimmed={orig_total > self.max_length}",
+                f"(orig_prompt={orig_prompt_len} orig_answer={orig_answer_len} orig_total={orig_total} "
+                f"eff_total={eff_total}) trimmed={eff_total > self.max_length}",
                 flush=True,
             )
             self._dbg_prints += 1
@@ -690,7 +701,8 @@ class ModelWrapper:
             "used_prompt_tokens": len(prompt_ids),
             "used_answer_tokens": len(answer_ids),
             "used_total_tokens": len(input_ids_list),
-            "trimmed": bool(orig_total > self.max_length),
+            "capped": bool(self.max_answer_tokens is not None and orig_answer_len > self.max_answer_tokens),
+            "trimmed": bool(eff_total > self.max_length),
         }
 
 
@@ -815,14 +827,16 @@ def main():
         model.eval()
 
         model_max_length = min(MAX_LENGTH, get_model_ctx_limit(model, tok))
-        wrap = ModelWrapper(model, tok, max_length=model_max_length, debug=DEBUG)
+        wrap = ModelWrapper(model, tok, max_length=model_max_length, max_answer_tokens=MAX_ANSWER_TOKENS, debug=DEBUG)
         print(f"[INFO] effective max_length = {model_max_length}", flush=True)
+        print(f"[INFO] max_answer_tokens    = {MAX_ANSWER_TOKENS}", flush=True)
 
         output = {
             "model_name": MODEL_NAME,
             "datasets_dir": str(datasets_dir),
             "max_length": model_max_length,
             "max_length_requested": MAX_LENGTH,
+            "max_answer_tokens": MAX_ANSWER_TOKENS,
             "limit_per_dataset": LIMIT_PER_DATASET,
             "dtype": DTYPE,
             "device_map": DEVICE_MAP,
@@ -875,6 +889,12 @@ def main():
 
             print(f"   valid: {summary['valid_count']}/{summary['count']}", flush=True)
             print(f"   mean loss: {summary['mean_loss']}", flush=True)
+
+            # Incremental save after each dataset; overwritten next iteration.
+            inc_path = Path(OUT_DIR) / f"{safe_name(MODEL_NAME.split('/')[-1])}__collected_losses.json"
+            with open(inc_path, "w", encoding="utf-8") as f:
+                json.dump(output, f, indent=2, ensure_ascii=False)
+            print(f"   [checkpoint] {inc_path}", flush=True)
 
         model_name_short = MODEL_NAME.split("/")[-1]
         out_path = Path(OUT_DIR) / f"{safe_name(model_name_short)}__collected_losses.json"
